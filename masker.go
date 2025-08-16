@@ -71,13 +71,17 @@ func Mask(v interface{}) {
 	maskValue(reflect.ValueOf(v))
 }
 
-// internal recursive function to handle nested structs, slices, and maps
+// internal recursive function to handle nested structs, slices, pointers, and maps
 func maskValue(rv reflect.Value) {
 	if !rv.IsValid() {
 		return
 	}
 
-	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+	// Dereference pointer if needed
+	if rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return
+		}
 		rv = rv.Elem()
 	}
 
@@ -107,13 +111,22 @@ func maskValue(rv reflect.Value) {
 				maskValue(value)
 			}
 		}
+
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
-			maskValue(rv.Index(i))
+			elem := rv.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				elem = elem.Elem()
+			}
+			maskValue(elem)
 		}
+
 	case reflect.Map:
 		for _, key := range rv.MapKeys() {
 			val := rv.MapIndex(key)
+			if val.Kind() == reflect.Ptr && !val.IsNil() {
+				val = val.Elem()
+			}
 			maskValue(val)
 		}
 	}
