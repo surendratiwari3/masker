@@ -8,80 +8,98 @@ import (
 // MaskFunc is a strategy function type
 type MaskFunc func(string) string
 
-// Global registry of masking strategies
+// Global registry of masking strategies (write once at init)
 var maskRegistry = map[string]MaskFunc{}
 
-// RegisterMaskFunc lets users register custom strategies
+// RegisterMaskFunc lets users register custom strategies (call during init only)
 func RegisterMaskFunc(name string, fn MaskFunc) {
 	maskRegistry[name] = fn
 }
 
-// init loads default strategies and groups
+// MaskOverrides allows runtime override of masking rules
+type MaskOverrides map[string]string
+// key = struct field name
+// value = strategy name ("none" = skip masking, or any registered strategy)
+
+// ---------------------- Initialize default strategies ----------------------
 func init() {
-	// ---------------- Basic reusable strategies ----------------
-	RegisterMaskFunc("partial", func(s string) string {
+	// Basic reusable strategies
+	maskRegistry["partial"] = func(s string) string {
 		if len(s) > 4 {
 			return s[:2] + strings.Repeat("*", len(s)-4) + s[len(s)-2:]
 		}
 		return strings.Repeat("*", len(s))
-	})
-	RegisterMaskFunc("full", func(s string) string {
-		return strings.Repeat("*", len(s))
-	})
-	RegisterMaskFunc("email", func(s string) string {
+	}
+	maskRegistry["full"] = func(s string) string { return strings.Repeat("*", len(s)) }
+	maskRegistry["email"] = func(s string) string {
 		parts := strings.Split(s, "@")
 		if len(parts) == 2 {
 			return parts[0][:1] + strings.Repeat("*", len(parts[0])-1) + "@" + parts[1]
 		}
 		return strings.Repeat("*", len(s))
-	})
-	RegisterMaskFunc("phone", func(s string) string {
+	}
+	maskRegistry["phone"] = func(s string) string {
 		if len(s) > 4 {
 			return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
 		}
 		return strings.Repeat("*", len(s))
-	})
-	RegisterMaskFunc("creditcard", func(s string) string {
+	}
+	maskRegistry["creditcard"] = func(s string) string {
 		if len(s) > 4 {
 			return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
 		}
 		return strings.Repeat("*", len(s))
-	})
-	RegisterMaskFunc("dob", func(s string) string {
+	}
+	maskRegistry["dob"] = func(s string) string {
 		if len(s) == 10 {
 			return "****-**-" + s[len(s)-2:]
 		}
 		return strings.Repeat("*", len(s))
-	})
-	RegisterMaskFunc("password", func(s string) string { return strings.Repeat("*", len(s)) })
-	RegisterMaskFunc("token", func(s string) string { return strings.Repeat("*", len(s)) })
+	}
+	maskRegistry["password"] = func(s string) string { return strings.Repeat("*", len(s)) }
+	maskRegistry["token"] = func(s string) string { return strings.Repeat("*", len(s)) }
 
-	// ---------------- Group strategies ----------------
-	RegisterMaskFunc("PII", func(s string) string { return maskRegistry["partial"](s) })
-	RegisterMaskFunc("PHI", func(s string) string { return maskRegistry["dob"](s) })
-	RegisterMaskFunc("PCI", func(s string) string { return maskRegistry["creditcard"](s) })
-	RegisterMaskFunc("CREDENTIALS", func(s string) string { return maskRegistry["full"](s) })
-	RegisterMaskFunc("FINANCIAL", func(s string) string { return maskRegistry["partial"](s) })
-	RegisterMaskFunc("GDPR", func(s string) string { return maskRegistry["full"](s) })
-	RegisterMaskFunc("none", func(s string) string { return s }) // explicit no-mask
+	// Group strategies
+	maskRegistry["PII"] = maskRegistry["partial"]
+	maskRegistry["PHI"] = maskRegistry["dob"]
+	maskRegistry["PCI"] = maskRegistry["creditcard"]
+	maskRegistry["CREDENTIALS"] = maskRegistry["full"]
+	maskRegistry["FINANCIAL"] = maskRegistry["partial"]
+	maskRegistry["GDPR"] = maskRegistry["full"]
+	maskRegistry["none"] = func(s string) string { return s }
 }
 
-// Mask applies masking based on struct tags (field/group/strategy)
+// ---------------------- Public Functions ----------------------
+
+// Mask applies masking based on struct tags (default behavior)
 func Mask(v interface{}) {
-	maskValue(reflect.ValueOf(v))
+	maskValue(reflect.ValueOf(v), nil)
 }
 
-// internal recursive function to handle nested structs, slices, pointers, and maps
-func maskValue(rv reflect.Value) {
+// MaskWithOverrides applies masking with runtime overrides
+func MaskWithOverrides(v interface{}, overrides MaskOverrides) {
+	maskValue(reflect.ValueOf(v), overrides)
+}
+
+// MaskCopy returns a masked copy of the struct, keeping original safe
+func MaskCopy(v interface{}, overrides MaskOverrides) interface{} {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return v
+	}
+	copyVal := reflect.New(rv.Elem().Type())
+	copyVal.Elem().Set(rv.Elem())
+	maskValue(copyVal, overrides)
+	return copyVal.Interface()
+}
+
+// ---------------------- Internal recursive functions ----------------------
+func maskValue(rv reflect.Value, overrides MaskOverrides) {
 	if !rv.IsValid() {
 		return
 	}
 
-	// Dereference pointer if needed
-	if rv.Kind() == reflect.Ptr {
-		if rv.IsNil() {
-			return
-		}
+	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
 		rv = rv.Elem()
 	}
 
@@ -94,40 +112,45 @@ func maskValue(rv reflect.Value) {
 			if !value.CanSet() {
 				continue
 			}
+			fieldName := field.Name
 
+			// ---------------- Runtime override ----------------
+			if overrides != nil {
+				if strategy, ok := overrides[fieldName]; ok {
+					if strategy == "none" {
+						continue
+					}
+					if fn, exists := maskRegistry[strategy]; exists && value.Kind() == reflect.String {
+						value.SetString(fn(value.String()))
+						continue
+					}
+				}
+			}
+
+			// ---------------- Tag-based default ----------------
 			tag := field.Tag.Get("mask")
 			if tag != "" && value.Kind() == reflect.String {
 				parts := strings.Split(tag, ";")
 				for _, part := range parts {
 					if strings.HasPrefix(part, "strategy:") {
-						strategy := strings.TrimPrefix(part, "strategy:")
-						if fn, ok := maskRegistry[strategy]; ok {
+						strat := strings.TrimPrefix(part, "strategy:")
+						if fn, ok := maskRegistry[strat]; ok {
 							value.SetString(fn(value.String()))
 						}
 					}
 				}
 			} else {
-				// recurse nested struct
-				maskValue(value)
+				maskValue(value, overrides)
 			}
 		}
-
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
-			elem := rv.Index(i)
-			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
-				elem = elem.Elem()
-			}
-			maskValue(elem)
+			maskValue(rv.Index(i), overrides)
 		}
-
 	case reflect.Map:
 		for _, key := range rv.MapKeys() {
 			val := rv.MapIndex(key)
-			if val.Kind() == reflect.Ptr && !val.IsNil() {
-				val = val.Elem()
-			}
-			maskValue(val)
+			maskValue(val, overrides)
 		}
 	}
 }
