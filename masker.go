@@ -1,7 +1,9 @@
 package masker
 
 import (
+	"context"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -18,7 +20,7 @@ func RegisterMaskFunc(name string, fn MaskFunc) {
 
 // MaskOverrides allows runtime override of masking rules
 type MaskOverrides map[string]string
-// key = struct field name
+// key = struct field name (nested fields can be dot-separated)
 // value = strategy name ("none" = skip masking, or any registered strategy)
 
 // ---------------------- Initialize default strategies ----------------------
@@ -73,12 +75,30 @@ func init() {
 
 // Mask applies masking based on struct tags (default behavior)
 func Mask(v interface{}) {
-	maskValue(reflect.ValueOf(v), nil)
+	maskValue(reflect.ValueOf(v), nil, "")
 }
 
 // MaskWithOverrides applies masking with runtime overrides
 func MaskWithOverrides(v interface{}, overrides MaskOverrides) {
-	maskValue(reflect.ValueOf(v), overrides)
+	maskValue(reflect.ValueOf(v), overrides, "")
+}
+
+// MaskWithContext applies masking with runtime overrides read from context
+// context keys:
+// "disableMasking" -> bool, skip masking entirely if true
+// "maskOverrides"  -> MaskOverrides, per-field override rules
+func MaskWithContext(v interface{}, ctx context.Context) {
+	if ctx == nil || v == nil {
+		return
+	}
+
+	disable, _ := ctx.Value("disableMasking").(bool)
+	if disable {
+		return
+	}
+
+	overrides, _ := ctx.Value("maskOverrides").(MaskOverrides)
+	maskValue(reflect.ValueOf(v), overrides, "")
 }
 
 // MaskCopy returns a masked copy of the struct, keeping original safe
@@ -89,12 +109,12 @@ func MaskCopy(v interface{}, overrides MaskOverrides) interface{} {
 	}
 	copyVal := reflect.New(rv.Elem().Type())
 	copyVal.Elem().Set(rv.Elem())
-	maskValue(copyVal, overrides)
+	maskValue(copyVal, overrides, "")
 	return copyVal.Interface()
 }
 
 // ---------------------- Internal recursive functions ----------------------
-func maskValue(rv reflect.Value, overrides MaskOverrides) {
+func maskValue(rv reflect.Value, overrides MaskOverrides, parentPath string) {
 	if !rv.IsValid() {
 		return
 	}
@@ -113,6 +133,9 @@ func maskValue(rv reflect.Value, overrides MaskOverrides) {
 				continue
 			}
 			fieldName := field.Name
+			if parentPath != "" {
+				fieldName = parentPath + "." + field.Name
+			}
 
 			// ---------------- Runtime override ----------------
 			if overrides != nil {
@@ -140,17 +163,18 @@ func maskValue(rv reflect.Value, overrides MaskOverrides) {
 					}
 				}
 			} else {
-				maskValue(value, overrides)
+				maskValue(value, overrides, fieldName)
 			}
 		}
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
-			maskValue(rv.Index(i), overrides)
+			idxPath := parentPath + "[" + strconv.Itoa(i) + "]"
+			maskValue(rv.Index(i), overrides, idxPath)
 		}
 	case reflect.Map:
 		for _, key := range rv.MapKeys() {
 			val := rv.MapIndex(key)
-			maskValue(val, overrides)
+			maskValue(val, overrides, parentPath+"."+key.String())
 		}
 	}
 }
